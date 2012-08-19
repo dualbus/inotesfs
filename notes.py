@@ -27,6 +27,13 @@ class DatabaseObject:
         con.close()
         return rows
 
+def cached(f):
+    @functools.wraps(f)
+    def wrapper(self, *args, **kwargs):
+        if self._psync is None or (time.time() - self._psync > 10):
+            self._synchronize()
+        return f(self, *args, **kwargs)
+    return wrapper
 
 def synchronized(f):
     @functools.wraps(f)
@@ -37,62 +44,123 @@ def synchronized(f):
 
 class Note(DatabaseObject):
 
-    F = re.compile(r'^/(\d+)\.txt$')
+    F = re.compile(r'^/(\d+)([^/]+)?\.txt$')
 
     # FIXME: length() doesn't work with bytes.
 
     SQL = {
     'note':
+#    '''
+#        select
+#                ZNOTE.Z_PK                  as
+#            id,
+#                ZNOTE.ZTITLE                as
+#            title,
+#                ZNOTE.ZAUTHOR               as
+#            author,
+#                ZNOTE.ZSUMMARY              as
+#            summary,
+#
+#                ZNOTE.ZBODY                 as
+#            body_id,
+#                ZNOTEBODY.ZCONTENT          as
+#            body,
+#                length(ZNOTEBODY.ZCONTENT)  as
+#            body_size,
+#                ZNOTE.ZCREATIONDATE         as
+#            itime,
+#                ZNOTE.ZMODIFICATIONDATE     as
+#            mtime,
+#
+#                ZNOTE.ZDELETEDFLAG          as
+#            deleted
+#
+#        from
+#            ZNOTE
+#        left join
+#            ZNOTEBODY
+#        on
+#            ZNOTE.ZBODY = ZNOTEBODY.Z_PK
+#        where
+#            ZNOTE.Z_PK = ?
+#        ;
+#    ''',
+
     '''
         select
-                ZNOTE.Z_PK                  as
+                Note.ROWID                  as
             id,
-                ZNOTE.ZTITLE                as
+                Note.title                  as
             title,
-                ZNOTE.ZAUTHOR               as
+                Note.author                 as
             author,
-                ZNOTE.ZSUMMARY              as
+                Note.summary                as
             summary,
 
-                ZNOTE.ZBODY                 as
+                note_bodies.note_id         as
             body_id,
-                ZNOTEBODY.ZCONTENT          as
+                note_bodies.data            as
             body,
-                length(ZNOTEBODY.ZCONTENT)  as
+                length(note_bodies.data)    as
             body_size,
-                ZNOTE.ZCREATIONDATE         as
+                Note.creation_date          as
             itime,
-                ZNOTE.ZMODIFICATIONDATE     as
-            mtime,
-
-                ZNOTE.ZDELETEDFLAG          as
-            deleted
+                Note.modification_date      as
+            mtime
 
         from
-            ZNOTE
+            Note 
         left join
-            ZNOTEBODY
+            note_bodies
         on
-            ZNOTE.ZBODY = ZNOTEBODY.Z_PK
+            Note.ROWID = note_bodies.note_id
         where
-            ZNOTE.Z_PK = ?
+            NOTE.ROWID = ?
         ;
     ''',
 
+
     'write_body':
+#    '''
+#        update
+#            ZNOTEBODY
+#        set
+#            ZCONTENT = ?
+#        where
+#            ZNOTEBODY.Z_PK = (
+#                select
+#                    ZNOTE.ZBODY
+#                from
+#                    ZNOTE
+#                where
+#                    ZNOTE.Z_PK = ?
+#            )
+#        ;
+#    ''',
     '''
         update
-            ZNOTEBODY
+            note_bodies
         set
-            ZCONTENT = ?
+            note_bodies.data = ?
         where
-            ZNOTEBODY.Z_PK = (
+            note_bodies.note_id = Note.ROWID
+        ;
+    ''',
+
+    'truncate_body':
+    '''
+        update
+            note_bodies
+        set
+            data = ?
+        where
+            note_id = (
                 select
-                    ZNOTE.ZBODY
+                    ROWID
                 from
-                    ZNOTE
+                    Note
                 where
-                    ZNOTE.Z_PK = ?
+                    Note.title = ?
             )
         ;
     ''',
@@ -114,6 +182,7 @@ class Note(DatabaseObject):
             # Create a new one. FIXME
             raise Exception('Note does not exist')
         self._id = nid
+        self._psync = time.time()
 
     def _synchronize(self):
         try:
@@ -127,13 +196,15 @@ class Note(DatabaseObject):
                 self._body_size,
                 self._itime,
                 self._mtime,
-                self._deleted,
+                #self._deleted,
                     ) = self._query(self.SQL['note'], self._id)[0]
         except IndexError:
             raise Exception('Note does not exist')
+        self._psync = None
 
     def get_id(self):
         return self._id
+
 
     @synchronized
     def read_body(self, offset, length):
@@ -153,21 +224,23 @@ class Note(DatabaseObject):
         body.truncate(size)
         self._query(self.SQL['write_body'], body.getvalue(), self._id)
 
-    @synchronized
+
+    @cached
     def get_size(self):
         return self._body_size
 
-    @synchronized
+    @cached
     def get_mtime(self):
         return self._mtime
 
-    @synchronized
+    @cached
     def get_deleted(self):
         return self._deleted
 
+
     @synchronized
     def get_filename(self):
-        return '{id:04d}.txt'.format(
+        return '{id:04d}-{title}.txt'.format(
                 id=self._id,
                 title=self._title.encode('utf-8')
                 )
@@ -179,7 +252,7 @@ class Note(DatabaseObject):
 
         m = Note.F.match(path)
         if m is not None:
-            return m.group(1)
+            return int(m.group(1))
         
         raise Exception(path)
 
@@ -188,11 +261,49 @@ class NoteCollection(DatabaseObject):
 
     SQL = {
     'notes':
+#    '''
+#        select
+#            Z_PK
+#        from
+#            ZNOTE
+#        ;
+#    ''',
     '''
         select
-            Z_PK
+            ROWID
         from
-            ZNOTE
+            note
+        ;
+    ''',
+    'notes_full':
+    '''
+        select
+                Note.ROWID                  as
+            id,
+                Note.title                  as
+            title,
+                Note.author                 as
+            author,
+                Note.summary                as
+            summary,
+
+                note_bodies.note_id         as
+            body_id,
+                note_bodies.data            as
+            body,
+                length(note_bodies.data)    as
+            body_size,
+                Note.creation_date          as
+            itime,
+                Note.modification_date      as
+            mtime
+
+        from
+            Note 
+        left join
+            note_bodies
+        on
+            Note.ROWID = note_bodies.note_id
         ;
     ''',
     }
@@ -200,11 +311,35 @@ class NoteCollection(DatabaseObject):
     def __init__(self, db):
         DatabaseObject.__init__(self, db)
         self._notes = {}
+        self._psync = None
 
     def _synchronize(self):
         self._notes = dict(((nid, Note(self._db, nid))
                 for (nid,) in self._query(self.SQL['notes'])))
+        for note in self._query(self.SQL['notes_full']):
+            try:
+                (
+                    self._notes[note[0]]._id,
+                    self._notes[note[0]]._title,
+                    self._notes[note[0]]._author,
+                    self._notes[note[0]]._summary,
+                    self._notes[note[0]]._body_id,
+                    self._notes[note[0]]._body,
+                    self._notes[note[0]]._body_size,
+                    self._notes[note[0]]._itime,
+                    self._notes[note[0]]._mtime,
+                    #self._deleted,
+                        ) = note
+            except Exception:
+                raise
+        self._psync = time.time()
 
+
+    @cached
+    def __getitem__(self, key):
+        return self._notes[key]
+
+    @cached
     def __iter__(self):
         return self._notes.itervalues()
 
@@ -231,15 +366,17 @@ class NotesFS(fuse.Fuse):
             st.st_ctime = st.st_atime
         else:
             try:
-                note = Note(self._db, Note.parse_path(path))
+                note = self._notes[Note.parse_path(path)]
                 st.st_size  = note.get_size()
                 st.st_mode  = stat.S_IFREG | 0666
-                st.st_nlink = int(note.get_deleted())
+                #st.st_nlink = int(note.get_deleted())
+                st.st_nlink = 1
                 st.st_atime = int(time.time())
                 st.st_mtime = int(note.get_mtime())
                 st.st_ctime = int(note.get_mtime())
             except:
-                return - errno.ENOENT
+                raise
+                return -errno.ENOENT
 
         return st
 
